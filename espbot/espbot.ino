@@ -1,0 +1,394 @@
+#include <Bluepad32.h>
+#include "driver/twai.h"
+
+// === Pin Definitions ===
+#define BTN_PAIR 17
+#define LED_R 13
+#define LED_B 14
+#define LED_G 15
+
+// === Global Joystick & Button Values ===
+volatile int joyLX = 0, joyLY = 0, joyRX = 0, joyRY = 0;
+volatile bool btnCross = false, btnCircle = false, btnSquare = false, btnTriangle = false;
+volatile bool btnL1 = false, btnR1 = false, btnL2 = false, btnR2 = false;
+volatile bool btnShare = false, btnOptions = false, btnL3 = false, btnR3 = false;
+volatile bool btnDpadUp = false, btnDpadDown = false, btnDpadLeft = false, btnDpadRight = false;
+volatile bool btnTouch = false, btnPS = false;
+
+volatile bool controllerConnected = false;
+
+GamepadPtr myGamepad;
+
+// Global shared variables for ServoHub
+volatile uint16_t servoPWM[6] = {1500,1500,1500,1500,1500,1500};
+volatile bool servoActive[6]  = {true,true,true,true,false,false};
+
+
+void initCAN() {
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_4, GPIO_NUM_5, TWAI_MODE_NORMAL);
+  twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_1MBITS();
+  twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  twai_driver_install(&g_config, &t_config, &f_config);
+  twai_start();
+  Serial.println("CAN started at 1 Mbps (TX=4, RX=5)");
+}
+
+// === Helper function: reset all to 0 ===
+void resetControllerValues() {
+  joyLX = joyLY = joyRX = joyRY = 0;
+  btnCross = btnCircle = btnSquare = btnTriangle = false;
+  btnL1 = btnR1 = btnL2 = btnR2 = false;
+  btnShare = btnOptions = btnL3 = btnR3 = false;
+  btnDpadUp = btnDpadDown = btnDpadLeft = btnDpadRight = false;
+  btnTouch = btnPS = false;
+}
+
+// === Callbacks ===
+void onConnectedGamepad(GamepadPtr gp) {
+  Serial.println("Gamepad connected!");
+  myGamepad = gp;
+  controllerConnected = true;
+  digitalWrite(LED_B, HIGH);
+}
+
+void onDisconnectedGamepad(GamepadPtr gp) {
+  Serial.println("Gamepad disconnected!");
+  if (myGamepad == gp)
+    myGamepad = nullptr;
+
+  controllerConnected = false;
+  resetControllerValues();
+  digitalWrite(LED_B, LOW);
+}
+
+// === Task: Controller Handler ===
+void TaskControllerHandler(void* pvParameters) {
+  for (;;) {
+    BP32.update();
+
+    if (digitalRead(BTN_PAIR) == LOW) {
+      Serial.println("Pairing button pressed!");
+      BP32.forgetBluetoothKeys();
+      BP32.enableNewBluetoothConnections(true);
+      digitalWrite(LED_G, HIGH);
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      digitalWrite(LED_G, LOW);
+    }
+
+    if (myGamepad && myGamepad->isConnected()) {
+    controllerConnected = true;
+
+    joyLX = myGamepad->axisX();
+    joyLY = myGamepad->axisY();
+    joyRX = myGamepad->axisRX();
+    joyRY = myGamepad->axisRY();
+
+    btnCross = myGamepad->a();
+    btnCircle = myGamepad->b();
+    btnSquare = myGamepad->x();
+    btnTriangle = myGamepad->y();
+    btnL1 = myGamepad->l1();
+    btnR1 = myGamepad->r1();
+    btnL2 = myGamepad->l2();
+    btnR2 = myGamepad->r2();
+
+    // misc buttons (names differ per SDK)
+    btnShare   = myGamepad->miscButtons() & MISC_BUTTON_START;  // “Share”
+    btnOptions = myGamepad->miscButtons() & MISC_BUTTON_HOME;   // “Options”
+    btnTouch   = false;  // not exposed in this core
+    btnPS      = myGamepad->miscButtons() & MISC_BUTTON_SYSTEM;
+
+    // stick buttons
+    btnL3 = myGamepad->thumbL();
+    btnR3 = myGamepad->thumbR();
+
+    // D-pad handling (value enum)
+    int dpad = myGamepad->dpad();
+    btnDpadUp    = (dpad == DPAD_UP);
+    btnDpadDown  = (dpad == DPAD_DOWN);
+    btnDpadLeft  = (dpad == DPAD_LEFT);
+    btnDpadRight = (dpad == DPAD_RIGHT);
+  }
+ else {
+      controllerConnected = false;
+      resetControllerValues();
+    }
+
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+}
+
+// === Task: Serial Printer ===
+void TaskSerialPrint(void* pvParameters) {
+  for (;;) {
+    if (!controllerConnected) {
+      Serial.println("=== Controller Disconnected ===");
+    } else {
+      Serial.println("=== Controller Data ===");
+      Serial.print("LX: "); Serial.print(joyLX);
+      Serial.print("\tLY: "); Serial.print(joyLY);
+      Serial.print("\tRX: "); Serial.print(joyRX);
+      Serial.print("\tRY: "); Serial.println(joyRY);
+
+      Serial.print("Cross: "); Serial.print(btnCross);
+      Serial.print("  Circle: "); Serial.print(btnCircle);
+      Serial.print("  Square: "); Serial.print(btnSquare);
+      Serial.print("  Triangle: "); Serial.println(btnTriangle);
+
+      Serial.print("L1: "); Serial.print(btnL1);
+      Serial.print("  R1: "); Serial.print(btnR1);
+      Serial.print("  L2: "); Serial.print(btnL2);
+      Serial.print("  R2: "); Serial.println(btnR2);
+
+      Serial.print("Share: "); Serial.print(btnShare);
+      Serial.print("  Options: "); Serial.print(btnOptions);
+      Serial.print("  L3: "); Serial.print(btnL3);
+      Serial.print("  R3: "); Serial.println(btnR3);
+
+      Serial.print("DPadUp: "); Serial.print(btnDpadUp);
+      Serial.print("  Down: "); Serial.print(btnDpadDown);
+      Serial.print("  Left: "); Serial.print(btnDpadLeft);
+      Serial.print("  Right: "); Serial.println(btnDpadRight);
+
+      Serial.print("Touch: "); Serial.print(btnTouch);
+      Serial.print("  PS: "); Serial.println(btnPS);
+    }
+
+    Serial.println();
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskRelayControl(void* pvParameters) {
+  bool lastState = false;
+  bool relayState = false;
+
+  for (;;) {
+    if (controllerConnected && btnCircle && !lastState) {
+      relayState = !relayState;                     // toggle relay
+      digitalWrite(25, relayState ? HIGH : LOW);    // IO25 is relay pin
+      Serial.print("Relay toggled -> ");
+      Serial.println(relayState ? "ON" : "OFF");
+      vTaskDelay(50 / portTICK_PERIOD_MS);          // debounce delay
+    }
+
+    lastState = btnCircle;
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskHeartbeat(void* pvParameters) {
+  const uint32_t HEARTBEAT_ID = 0x01011840;  // FRC roboRIO heartbeat (extended)
+  bool ledState = false;
+  uint32_t tick = 0;
+
+  // --- Start time ---
+  uint16_t year = 2025;
+  uint8_t  month = 10;
+  uint8_t  day = 10;
+  uint8_t  hour = 0;
+  uint8_t  minute = 0;
+  uint8_t  second = 0;
+  uint32_t lastSecondTick = 0;
+
+  for (;;) {
+    tick++;
+
+    // Advance internal clock once per second
+    if ((tick - lastSecondTick) >= 50) {  // 50 Hz loop → 1 s
+      lastSecondTick = tick;
+      second++;
+      if (second >= 60) { second = 0; minute++; }
+      if (minute >= 60) { minute = 0; hour++; }
+      if (hour >= 24)  { hour = 0; day++; }
+      if (day > 31)    { day = 1; month++; }
+      if (month > 12)  { month = 1; year++; }
+    }
+
+    if (controllerConnected) {
+      // --- Pack FRC heartbeat bits ---
+      uint64_t bits = 0;
+      bits |= ((uint64_t)(hour & 0x1F)) << 0;
+      bits |= ((uint64_t)(minute & 0x3F)) << 5;
+      bits |= ((uint64_t)(second & 0x3F)) << 11;
+      bits |= ((uint64_t)(day & 0x1F)) << 17;
+      bits |= ((uint64_t)((month - 1) & 0x0F)) << 22;
+      bits |= ((uint64_t)((year - 2000 + 36) & 0x3F)) << 26;
+      bits |= ((uint64_t)0) << 32;  // tournament_type
+      bits |= ((uint64_t)0) << 35;  // watchdog
+      bits |= ((uint64_t)0) << 36;  // test
+      bits |= ((uint64_t)0) << 37;  // auto
+      bits |= ((uint64_t)1) << 38;  // enabled = 1 only when connected
+      bits |= ((uint64_t)0) << 39;  // alliance_blue
+      bits |= ((uint64_t)0) << 40;  // replay_number
+      bits |= ((uint64_t)1) << 46;  // match_number
+      bits |= ((uint64_t)135) << 56;  // match_time
+
+      uint8_t data[8];
+      for (int i = 0; i < 8; i++)
+        data[7 - i] = (bits >> (i * 8)) & 0xFF;
+
+      twai_message_t msg = {};
+      msg.identifier = HEARTBEAT_ID;
+      msg.extd = 1;
+      msg.data_length_code = 8;
+      memcpy(msg.data, data, 8);
+      twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+      // Blink LED at 2 Hz to show heartbeat active
+      static uint8_t ledCounter = 0;
+      if (++ledCounter >= 25) {
+        ledState = !ledState;
+        digitalWrite(LED_G, ledState);
+        ledCounter = 0;
+      }
+    } 
+    else {
+      // Controller disconnected → no CAN frame, LED off
+      digitalWrite(LED_G, LOW);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz loop
+  }
+}
+
+
+// helper to send 3-channel group
+void sendServoGroup(uint8_t group, uint8_t hubID, uint16_t p0, uint16_t p1, uint16_t p2,
+                    bool r0, bool r1, bool r2) {
+  uint32_t base = (group == 0) ? 0x0C050000 : 0x0C050040;
+  uint32_t arb  = base | (hubID & 0x3F);
+
+  uint8_t data[7];
+  data[0] = p0 & 0xFF;
+  data[1] = p0 >> 8;
+  data[2] = p1 & 0xFF;
+  data[3] = p1 >> 8;
+  data[4] = p2 & 0xFF;
+  data[5] = p2 >> 8;
+
+  uint8_t runPower = (r0 ? 1 : 0) | ((r1 ? 1 : 0) << 1) | ((r2 ? 1 : 0) << 2)
+                   | ((r0 ? 1 : 0) << 3) | ((r1 ? 1 : 0) << 4) | ((r2 ? 1 : 0) << 5);
+  data[6] = runPower;
+
+  twai_message_t msg = {0};
+  msg.identifier = arb;
+  msg.extd = 1;
+  msg.data_length_code = 7;
+  memcpy(msg.data, data, 7);
+  twai_transmit(&msg, pdMS_TO_TICKS(20));
+}
+
+void TaskServoHub(void* pvParameters) {
+  const uint8_t hubID = 3;  // your device number
+  for (;;) {
+    // send both groups every 50 ms
+    sendServoGroup(0, hubID, servoPWM[0], servoPWM[1], servoPWM[2],
+                   servoActive[0], servoActive[1], servoActive[2]);
+    sendServoGroup(1, hubID, servoPWM[3], servoPWM[4], servoPWM[5],
+                   servoActive[3], servoActive[4], servoActive[5]);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void TaskRobotController(void* pvParameters) {
+  const int DEADZONE = 20;       // joystick deadband (±20)
+  const int CENTER_PWM = 1500;   // neutral PWM
+  const int SCALE = 500;         // joystick full deflection = ±500 µs
+
+  for (;;) {
+    if (controllerConnected) {
+      // Raw joystick values (-512..512 typical)
+      int lx_raw = joyLX;
+      int rx_raw = joyRX;
+      int ry_raw = -joyRY;  // invert so pushing forward is positive
+
+      // Apply deadband
+      if (abs(lx_raw) < DEADZONE) lx_raw = 0;
+      if (abs(rx_raw) < DEADZONE) rx_raw = 0;
+      if (abs(ry_raw) < DEADZONE) ry_raw = 0;
+
+      // Normalize to -1..1 range
+      float lx = lx_raw / 512.0f;  // rotation
+      float rx = rx_raw / 512.0f;  // strafe
+      float ry = ry_raw / 512.0f;  // forward/backward
+
+      // --- Omni wheel kinematics (45°) ---
+      // Port mapping:
+      // 1 Left Top
+      // 2 Right Top
+      // 3 Right Down
+      // 4 Left Down
+      float m1 =  ry + rx + lx;   // port 1 (left top)
+      float m2 =  ry - rx - lx;   // port 2 (right top)
+      float m3 =  ry + rx - lx;   // port 3 (right down)
+      float m4 =  ry - rx + lx;   // port 4 (left down)
+
+      // Invert all right-side motors
+      m2 = -m2;
+      m3 = -m3;
+
+      // Normalize output so max magnitude = 1
+      float maxVal = fmax(fmax(fabs(m1), fabs(m2)), fmax(fabs(m3), fabs(m4)));
+      if (maxVal > 1.0f) {
+        m1 /= maxVal; m2 /= maxVal; m3 /= maxVal; m4 /= maxVal;
+      }
+
+      // Convert to servo microseconds
+      servoPWM[0] = CENTER_PWM + (int)(m1 * SCALE);
+      servoPWM[1] = CENTER_PWM + (int)(m2 * SCALE);
+      servoPWM[2] = CENTER_PWM + (int)(m3 * SCALE);
+      servoPWM[3] = CENTER_PWM + (int)(m4 * SCALE);
+
+      // Enable those 4 servos
+      servoActive[0] = servoActive[1] = servoActive[2] = servoActive[3] = true;
+    } 
+    else {
+      // Controller disconnected → stop all motors
+      for (int i = 0; i < 4; i++) {
+        servoPWM[i] = 1500;
+        servoActive[i] = false;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz control loop
+  }
+}
+
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== ESP32 Bluepad32 RTOS Controller Demo ===");
+
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(BTN_PAIR, INPUT_PULLUP);
+
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_B, LOW);
+  digitalWrite(LED_G, HIGH);
+
+  pinMode(25, OUTPUT); // relay
+  digitalWrite(25, LOW);
+
+  BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
+  BP32.enableNewBluetoothConnections(true);
+
+  initCAN();
+
+  // Create FreeRTOS tasks
+  xTaskCreatePinnedToCore(TaskControllerHandler, "ControllerHandler", 4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(TaskSerialPrint, "SerialPrint", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskRelayControl, "RelayControl", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskHeartbeat, "Heartbeat", 2048, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(TaskServoHub, "ServoHub", 2048, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(TaskRobotController, "RobotController", 4096, NULL, 2, NULL, 1);
+
+
+}
+
+void loop() {
+  vTaskDelete(NULL); // loop not used
+}
