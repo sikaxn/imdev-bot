@@ -1,17 +1,5 @@
 #include <Bluepad32.h>
 #include "driver/twai.h"
-#include <Arduino.h>
-#include "wit_c_sdk.h"
-#include "REG.h"
-
-// ESP32 UART2 pins for the sensor
-static const int UART_TX_PIN = 23;   // IO23
-static const int UART_RX_PIN = 19;   // IO19
-static const uint32_t WT_BAUD = 115200;
-
-// HAL shims for Wit SDK
-static void SerialWriteFunc(uint8_t* data, uint32_t len) { Serial2.write(data, len); }
-static void DelayMs(uint16_t ms) { delay(ms); }
 
 // === Pin Definitions ===
 #define BTN_PAIR 17
@@ -29,71 +17,12 @@ volatile bool btnTouch = false, btnPS = false;
 
 volatile bool controllerConnected = false;
 
-volatile uint32_t imu_update_ms = 0;  
-
 GamepadPtr myGamepad;
 
 // Global shared variables for ServoHub
 volatile uint16_t servoPWM[6] = {1500,1500,1500,1500,1500,1500};
 volatile bool servoActive[6]  = {true,true,true,true,false,false};
 
-// Global variables to hold sensor data
-float imu_ax = 0.0f, imu_ay = 0.0f, imu_az = 0.0f;
-float imu_gx = 0.0f, imu_gy = 0.0f, imu_gz = 0.0f;
-float imu_roll = 0.0f, imu_pitch = 0.0f, imu_yaw = 0.0f;
-
-// ===== Globals / indicators =====
-volatile bool  fieldOriented     = true;    // start in field mode if you like
-volatile bool  headless          = false;   // Cross toggles
-static   bool  lastBtnCross      = false;
-static   bool  lastBtnCircle     = false;
-static   float headlessTargetYaw = 0.0f;    // deg at enable
-static   float fieldYawZero      = 0.0f;    // captured yaw when field mode enabled
-
-const    int   LED_HEADLESS_PIN  = LED_B;   // ON = headless
-const    int   LED_FIELD_PIN     = LED_G;   // ON = field-oriented
-
-
-
-// In your existing SensorDataUpdate():
-static void SensorDataUpdate(uint32_t uiReg, uint32_t uiRegNum) {
-  if (uiReg == AX || uiReg == GX || uiReg == Roll) {
-    // ... your existing assignments ...
-    imu_ax    = (float)sReg[AX]    / 32768.0f * 16.0f;
-    imu_ay    = (float)sReg[AY]    / 32768.0f * 16.0f;
-    imu_az    = (float)sReg[AZ]    / 32768.0f * 16.0f;
-
-    imu_gx    = (float)sReg[GX]    / 32768.0f * 2000.0f;
-    imu_gy    = (float)sReg[GY]    / 32768.0f * 2000.0f;
-    imu_gz    = (float)sReg[GZ]    / 32768.0f * 2000.0f;
-
-    imu_roll  = (float)sReg[Roll]  / 32768.0f * 180.0f;
-    imu_pitch = (float)sReg[Pitch] / 32768.0f * 180.0f;
-    imu_yaw   = (float)sReg[Yaw]   / 32768.0f * 180.0f;
-
-    // Timestamp when ANGLE block is present
-    if (uiReg == Roll) {
-      imu_update_ms = millis();
-    }
-  }
-}
-
-// Wrap to [-180,180]
-static inline float wrapDeg(float e) {
-  while (e > 180.0f) e -= 360.0f;
-  while (e < -180.0f) e += 360.0f;
-  return e;
-}
-
-// Predictive yaw helper (reduces perceived lag)
-static inline float getPredictedYaw() {
-  const uint32_t now_ms = millis();
-  const uint32_t upd_ms = imu_update_ms;
-  float age_s = (now_ms >= upd_ms) ? (now_ms - upd_ms) / 1000.0f : 0.0f;
-  const float EXTRA_LEAD_S = 0.02f;  // try 0.00–0.04 s if needed
-  float yaw_pred = imu_yaw + imu_gz * (age_s + EXTRA_LEAD_S);
-  return wrapDeg(yaw_pred);
-}
 
 void initCAN() {
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_4, GPIO_NUM_5, TWAI_MODE_NORMAL);
@@ -225,30 +154,10 @@ void TaskSerialPrint(void* pvParameters) {
       Serial.print("  PS: "); Serial.println(btnPS);
     }
 
-    // === Always print IMU data ===
-    const float ax    = imu_ax;
-    const float ay    = imu_ay;
-    const float az    = imu_az;
-    const float gx    = imu_gx;
-    const float gy    = imu_gy;
-    const float gz    = imu_gz;
-    const float roll  = imu_roll;
-    const float pitch = imu_pitch;
-    const float yaw   = imu_yaw;
-
-    Serial.println("=== IMU Sensor Data ===");
-    Serial.print("ACC[g] ");
-    Serial.printf("%6.2f %6.2f %6.2f | ", ax, ay, az);
-    Serial.print("GYRO[dps] ");
-    Serial.printf("%7.2f %7.2f %7.2f | ", gx, gy, gz);
-    Serial.print("ANGLE[deg] ");
-    Serial.printf("%7.2f %7.2f %7.2f\n", roll, pitch, yaw);
-
     Serial.println();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
-
 
 void TaskRelayControl(void* pvParameters) {
   bool lastState = false;
@@ -382,173 +291,75 @@ void TaskServoHub(void* pvParameters) {
   }
 }
 
-void TaskIMU(void* pvParameters) {
-  for (;;) {
-    while (Serial2.available() > 0) {
-      uint8_t b = (uint8_t)Serial2.read();
-      WitSerialDataIn(b);
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));  // or 2–5 ms if you prefer
-  }
-}
-
 void TaskRobotController(void* pvParameters) {
-  const int   DEADZONE        = 20;     // raw stick deadband (±20)
-  const int   CENTER_PWM      = 1500;
-  const int   SCALE           = 500;
-  const float kP_heading      = 0.005f;
-  const float rotLimit        = 0.5f;
-  const float rotDeadbandEZ   = 0.05f;
-  const float errZeroWindow   = 1.5f;
-  const float transAdoptThres = 0.10f;
-  const float inputTransThres = 0.05f;
-  const float inputRotThres   = 0.05f;
-  const float dt_s            = 0.02f;
-
-  const int LED_HEADLESS_PIN = LED_B;
-  const int LED_FIELD_PIN    = LED_G;
-
-  pinMode(LED_HEADLESS_PIN, OUTPUT);
-  pinMode(LED_FIELD_PIN, OUTPUT);
-  digitalWrite(LED_HEADLESS_PIN, LOW);
-  digitalWrite(LED_FIELD_PIN, fieldOriented ? HIGH : LOW);
-
-  if (fieldOriented) fieldYawZero = getPredictedYaw();
+  const int DEADZONE = 20;       // joystick deadband (±20)
+  const int CENTER_PWM = 1500;   // neutral PWM
+  const int SCALE = 500;         // joystick full deflection = ±500 µs
 
   for (;;) {
-    // === Toggles ===
-    bool crossNow  = btnCross;
-    bool circleNow = btnCircle;
-
-    // Headless toggle (Cross)
-    if (crossNow && !lastBtnCross) {
-      headless = !headless;
-      if (headless) headlessTargetYaw = getPredictedYaw();
-      digitalWrite(LED_HEADLESS_PIN, headless ? HIGH : LOW);
-    }
-    lastBtnCross = crossNow;
-
-    // Field-oriented toggle (Circle)
-    if (circleNow && !lastBtnCircle) {
-      fieldOriented = !fieldOriented;
-      if (fieldOriented) fieldYawZero = getPredictedYaw();
-      digitalWrite(LED_FIELD_PIN, fieldOriented ? HIGH : LOW);
-    }
-    lastBtnCircle = circleNow;
-
     if (controllerConnected) {
-      // === Raw joystick inputs ===
-      int lx_raw = joyRX;     // rotation (was joyLX)
-      int rx_raw = joyLX;     // strafe  (was joyRX)
-      int ry_raw = +joyRY;    // fix inverted Y (remove the minus)
+      // Raw joystick values (-512..512 typical)
+      int lx_raw = joyLX;
+      int rx_raw = joyRX;
+      int ry_raw = -joyRY;  // invert so pushing forward is positive
 
-      // Deadband
+      // Apply deadband
       if (abs(lx_raw) < DEADZONE) lx_raw = 0;
       if (abs(rx_raw) < DEADZONE) rx_raw = 0;
       if (abs(ry_raw) < DEADZONE) ry_raw = 0;
 
-      // Normalize
-      float lx = lx_raw / 512.0f;
-      float rx = rx_raw / 512.0f;
-      float ry = ry_raw / 512.0f;
+      // Normalize to -1..1 range
+      float lx = lx_raw / 512.0f;  // rotation
+      float rx = rx_raw / 512.0f;  // strafe
+      float ry = ry_raw / 512.0f;  // forward/backward
 
-      // Input magnitudes
-      float rotMag   = fabs(lx);
-      float transMag = sqrtf(rx*rx + ry*ry);
+      // --- Omni wheel kinematics (45°) ---
+      // Port mapping:
+      // 1 Left Top
+      // 2 Right Top
+      // 3 Right Down
+      // 4 Left Down
+      float m1 =  ry + rx + lx;   // port 1 (left top)
+      float m2 =  ry - rx - lx;   // port 2 (right top)
+      float m3 =  ry + rx - lx;   // port 3 (right down)
+      float m4 =  ry - rx + lx;   // port 4 (left down)
 
-      // === Idle guard ===
-      if (transMag <= inputTransThres && rotMag <= inputRotThres) {
-        for (int i = 0; i < 4; i++) servoPWM[i] = CENTER_PWM;
-        servoActive[0] = servoActive[1] = servoActive[2] = servoActive[3] = true;
-        vTaskDelay(pdMS_TO_TICKS(20));
-        continue;
-      }
+      // Invert all right-side motors
+      m2 = -m2;
+      m3 = -m3;
 
-      // === Field-oriented transform ===
-      if (fieldOriented) {
-        float yaw_rel = wrapDeg(getPredictedYaw() - fieldYawZero);
-        float th = yaw_rel * (float)M_PI / 180.0f;
-        float c = cosf(th), s = sinf(th);
-        float rx_r =  rx * c - ry * s;
-        float ry_r =  rx * s + ry * c;
-        rx = rx_r;
-        ry = ry_r;
-      }
-
-      // === Headless behavior ===
-      if (headless) {
-        float yaw_now = getPredictedYaw();
-
-        // Adopt heading while translating
-        float transMag_after = sqrtf(rx*rx + ry*ry);
-        if (transMag_after > transAdoptThres) headlessTargetYaw = yaw_now;
-
-        // Heading hold correction
-        float errDeg  = wrapDeg(headlessTargetYaw - yaw_now);
-        float lx_hold = 0.0f;
-        if (fabs(errDeg) > errZeroWindow) {
-          lx_hold = kP_heading * errDeg;
-          lx_hold = constrain(lx_hold, -rotLimit, rotLimit);
-        }
-        lx += lx_hold;
-
-        // In headless + field mode, update field reference when rotating
-        if (fieldOriented && fabs(lx) > rotDeadbandEZ) {
-          const float assumedMaxYawRate = 180.0f;
-          fieldYawZero = wrapDeg(fieldYawZero - lx * assumedMaxYawRate * dt_s);
-        }
-      }
-
-      // Final small rotation deadband
-      if (fabs(lx) < rotDeadbandEZ) lx = 0.0f;
-
-      // === X-Drive Kinematics (45° omni wheels) ===
-      // Front-Left (1):  +F +S +R
-      // Front-Right(2):  +F −S −R  (inverted)
-      // Rear-Left (3):   +F −S +R
-      // Rear-Right(4):   +F +S −R  (inverted)
-
-      float m1 =  ry + rx + lx;  // Front-Left
-      float m2 =  ry - rx - lx;  // Front-Right
-      float m3 =  ry - rx + lx;  // Rear-Left
-      float m4 =  ry + rx - lx;  // Rear-Right
-
-      // === Invert all right-side wheels ===
-      m2 = -m2;  // front-right
-      m3 = -m3;  // RL invert
-
-      // Normalize to |1|
+      // Normalize output so max magnitude = 1
       float maxVal = fmax(fmax(fabs(m1), fabs(m2)), fmax(fabs(m3), fabs(m4)));
-      if (maxVal > 1.0f) { m1/=maxVal; m2/=maxVal; m3/=maxVal; m4/=maxVal; }
+      if (maxVal > 1.0f) {
+        m1 /= maxVal; m2 /= maxVal; m3 /= maxVal; m4 /= maxVal;
+      }
 
-      // Convert to servo PWM
-      servoPWM[0] = CENTER_PWM + (int)(m1 * SCALE); // FL
-      servoPWM[1] = CENTER_PWM + (int)(m2 * SCALE); // FR (inverted)
-      servoPWM[2] = CENTER_PWM + (int)(m3 * SCALE); // RL
-      servoPWM[3] = CENTER_PWM + (int)(m4 * SCALE); // RR (inverted)
+      // Convert to servo microseconds
+      servoPWM[0] = CENTER_PWM + (int)(m1 * SCALE);
+      servoPWM[1] = CENTER_PWM + (int)(m2 * SCALE);
+      servoPWM[2] = CENTER_PWM + (int)(m3 * SCALE);
+      servoPWM[3] = CENTER_PWM + (int)(m4 * SCALE);
+
+      // Enable those 4 servos
       servoActive[0] = servoActive[1] = servoActive[2] = servoActive[3] = true;
-
-    } else {
-      // === Controller disconnected ===
+    } 
+    else {
+      // Controller disconnected → stop all motors
       for (int i = 0; i < 4; i++) {
-        servoPWM[i] = CENTER_PWM;
+        servoPWM[i] = 1500;
         servoActive[i] = false;
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(20));  // 50 Hz control loop
   }
 }
-
 
 
 // === Setup ===
 void setup() {
   Serial.begin(115200);
   Serial.println("=== ESP32 Bluepad32 RTOS Controller Demo ===");
-  Serial2.begin(WT_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  Serial.println("\nWT901 (JY901) UART reader on ESP32: TX=IO23, RX=IO19 @ 115200");
-
 
   pinMode(LED_R, OUTPUT);
   pinMode(LED_B, OUTPUT);
@@ -567,13 +378,6 @@ void setup() {
 
   initCAN();
 
-  // Init Wit SDK in "normal" UART protocol
-  WitInit(WIT_PROTOCOL_NORMAL, 0x50);
-  WitSerialWriteRegister(SerialWriteFunc);
-  WitDelayMsRegister(DelayMs);
-  WitRegisterCallBack(SensorDataUpdate);
-  Serial.println("Wit SDK ready. Waiting for data...");
-  
   // Create FreeRTOS tasks
   xTaskCreatePinnedToCore(TaskControllerHandler, "ControllerHandler", 4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(TaskSerialPrint, "SerialPrint", 4096, NULL, 1, NULL, 1);
@@ -581,7 +385,7 @@ void setup() {
   xTaskCreatePinnedToCore(TaskHeartbeat, "Heartbeat", 2048, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(TaskServoHub, "ServoHub", 2048, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(TaskRobotController, "RobotController", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskIMU, "TaskIMU", 4096, NULL, 2, NULL, 1);
+
 
 }
 
